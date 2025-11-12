@@ -123,6 +123,15 @@ if st.button("Run Cleaning"):
         summary_df, logs, cleaned_data = process_files(clean_files, suppression)
         for l in logs: st.write(l)
 
+        # Build ZIP for download
+        zip_buffer = io.BytesIO()
+        with ZipFile(zip_buffer, "w") as zf:
+            for name, data in cleaned_data.items():
+                zf.writestr(name, data)
+            summary_csv = summary_df.to_csv(index=False)
+            zf.writestr("_Cleaning_Summary.csv", summary_csv)
+        zip_buffer.seek(0)
+
 
         # Build ZIP for download with visible progress
         st.info("Preparing download… please wait while files are compressed.")
@@ -145,3 +154,15 @@ if st.button("Run Cleaning"):
         
         zip_buffer.seek(0)
         progress_text.text("✅ ZIP ready for download.")
+
+
+        st.success("✅ Cleaning complete!")
+        st.write(f"⏱ Duration: {datetime.now() - start}")
+        st.subheader("📊 Summary")
+        st.dataframe(summary_df)
+        st.download_button(
+            "⬇️ Download Cleaned Files (ZIP)",
+            data=zip_buffer,
+            file_name="Cleaned_Files.zip",
+            mime="application/zip"
+        )
