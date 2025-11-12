@@ -123,22 +123,25 @@ if st.button("Run Cleaning"):
         summary_df, logs, cleaned_data = process_files(clean_files, suppression)
         for l in logs: st.write(l)
 
-        # Build ZIP for download
+
+        # Build ZIP for download with visible progress
+        st.info("Preparing download… please wait while files are compressed.")
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+        
         zip_buffer = io.BytesIO()
+        file_count = len(cleaned_data) + 1  # +1 for summary file
+        
         with ZipFile(zip_buffer, "w") as zf:
-            for name, data in cleaned_data.items():
+            for i, (name, data) in enumerate(cleaned_data.items(), start=1):
+                progress_text.text(f"Adding {name} ({i}/{file_count})…")
                 zf.writestr(name, data)
+                progress_bar.progress(int(i / file_count * 100))
+            # write summary at the end
+            progress_text.text("Adding summary file…")
             summary_csv = summary_df.to_csv(index=False)
             zf.writestr("_Cleaning_Summary.csv", summary_csv)
+            progress_bar.progress(100)
+        
         zip_buffer.seek(0)
-
-        st.success("✅ Cleaning complete!")
-        st.write(f"⏱ Duration: {datetime.now() - start}")
-        st.subheader("📊 Summary")
-        st.dataframe(summary_df)
-        st.download_button(
-            "⬇️ Download Cleaned Files (ZIP)",
-            data=zip_buffer,
-            file_name="Cleaned_Files.zip",
-            mime="application/zip"
-        )
+        progress_text.text("✅ ZIP ready for download.")
