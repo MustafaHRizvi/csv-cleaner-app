@@ -5,20 +5,36 @@ import streamlit as st
 from zipfile import ZipFile
 from datetime import datetime
 
+
+CHUNK_SIZE = 50000  # split threshold
+
+
 # ============================================================
-#              CASE-INSENSITIVE COLUMN FINDER
+# SAVE UPLOADED FILE TO DISK (crucial for memory safety)
+# ============================================================
+def save_uploaded_to_disk(uploaded_file):
+    suffix = os.path.splitext(uploaded_file.name)[1] or ".csv"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(uploaded_file.getbuffer())
+    tmp_path = tmp.name
+    tmp.close()
+    return tmp_path
+
+
+# ============================================================
+# CASE-INSENSITIVE COLUMN FINDER
 # ============================================================
 def find_col(df, patterns):
     for col in df.columns:
         lc = col.lower()
         for p in patterns:
             if p in lc:
-                return col  # return original column name
+                return col
     return None
 
 
 # ============================================================
-#              CLEANING HELPERS
+# CLEANING HELPERS
 # ============================================================
 def clean_email(email):
     if pd.isna(email): return None
@@ -37,18 +53,18 @@ def clean_domain(value):
 
 
 # ============================================================
-#      STRONG SUPPRESSION EMAIL NORMALIZER (IMPORTANT)
+# NORMALIZE SUPPRESSION EMAILS
 # ============================================================
 def normalize_suppression_email(e):
     if pd.isna(e): return None
     e = str(e).strip().lower()
-    e = re.sub(r"[\"'\s]", "", e)          # remove spaces & quotes
-    e = re.sub(r"^email[:\-]*", "", e)     # remove "email:" prefixes
+    e = re.sub(r"[\"'\s]", "", e)
+    e = re.sub(r"^email[:\-]*", "", e)
     return e
 
 
 # ============================================================
-#          LOAD SUPPRESSION DATA (ROBUST)
+# LOAD SUPPRESSION DATA (small and safe)
 # ============================================================
 def load_suppression_data(files):
     emails, phones, domains = set(), set(), set()
@@ -67,34 +83,28 @@ def load_suppression_data(files):
                 elif "phone" in lc:
                     phones.update(df[c].dropna().map(clean_phone))
                     found.append(c)
-                elif "domain" in lc or "website" in lc or "url" in lc:
+                elif any(x in lc for x in ["domain", "website", "url"]):
                     domains.update(df[c].dropna().map(clean_domain))
                     found.append(c)
 
-            logs.append(f"✅ {f.name}: found {', '.join(found) if found else 'no usable columns'}")
+            logs.append(f"✅ {getattr(f,'name',f)}: found {', '.join(found) if found else 'no usable columns'}")
 
         except Exception as e:
-            logs.append(f"⚠️ {f.name} skipped: {e}")
+            logs.append(f"⚠️ {getattr(f,'name',f)} skipped: {e}")
 
     return {"emails": emails, "phones": phones, "domains": domains, "logs": logs}
 
 
 # ============================================================
-#           HYBRID CLEAN ONE CHUNK (IMPORTANT)
+# CLEAN ONE CHUNK
 # ============================================================
 def clean_chunk(df, suppression):
+    removed_email = removed_phone = removed_domain = 0
 
-    removed_email = 0
-    removed_phone = 0
-    removed_domain = 0
-
-    # ---- Primary strict detection ----
+    # ---- Email ----
     strict_email_col = find_col(df, ["email"])
-
-    # ---- Legacy fallback detection ----
     fallback_email_cols = [c for c in df.columns if "email" in c.lower()]
 
-    # ---- Merge ----
     email_cols = []
     if strict_email_col:
         email_cols.append(strict_email_col)
@@ -102,74 +112,97 @@ def clean_chunk(df, suppression):
         if c not in email_cols:
             email_cols.append(c)
 
-    # ---- Clean ALL email-like columns ----
-    for ec in email_cols:
-        df["__email"] = df[ec].map(clean_email)
+    for col in email_cols:
+        df["__email"] = df[col].map(clean_email)
         before = len(df)
         df = df[~df["__email"].isin(suppression["emails"])]
         removed_email += before - len(df)
 
     # ---- Phone ----
     phone_cols = [c for c in df.columns if "phone" in c.lower()]
-    for pc in phone_cols:
-        df["__phone"] = df[pc].map(clean_phone)
+    for col in phone_cols:
+        df["__phone"] = df[col].map(clean_phone)
         before = len(df)
         df = df[~df["__phone"].isin(suppression["phones"])]
         removed_phone += before - len(df)
 
     # ---- Domain ----
-    domain_cols = [
-        c for c in df.columns
-        if ("domain" in c.lower() or "website" in c.lower() or "url" in c.lower())
-    ]
-    for dc in domain_cols:
-        df["__domain"] = df[dc].map(clean_domain)
+    domain_cols = [c for c in df.columns if any(x in c.lower() for x in ["domain", "website", "url"])]
+    for col in domain_cols:
+        df["__domain"] = df[col].map(clean_domain)
         before = len(df)
         df = df[~df["__domain"].isin(suppression["domains"])]
         removed_domain += before - len(df)
 
-    cleaned_df = df[[c for c in df.columns if not c.startswith("__")]]
+    df = df[[c for c in df.columns if not c.startswith("__")]]
 
-    return cleaned_df, removed_email, removed_phone, removed_domain
+    return df, removed_email, removed_phone, removed_domain
 
 
 # ============================================================
-#             PROCESS CLEANING FILES (CHUNKED)
+# MEMORY-SAFE PROCESSOR
 # ============================================================
 def process_files(files_to_clean, suppression):
-    summary, logs, outputs = [], [], {}
+    summary, logs = [], []
+    cleaned_paths = {}   # {filename: temp_path}
 
-    for f in files_to_clean:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        first = True
+    total_files = len(files_to_clean)
+    global_bar = st.progress(0)
+    global_status = st.empty()
 
+    for file_index, uploaded in enumerate(files_to_clean, start=1):
+        global_status.write(f"Processing {uploaded.name} ({file_index}/{total_files})")
+        global_bar.progress(int((file_index - 1) / total_files * 100))
+
+        # 1. Save uploaded file to disk
+        source_path = save_uploaded_to_disk(uploaded)
+
+        # 2. Temp cleaned output file
+        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        out_path = out_tmp.name
+        out_tmp.close()
+
+        first_write = True
         rows_before = 0
         cols_found = []
-        removed_email_total = 0
-        removed_phone_total = 0
-        removed_domain_total = 0
+        removed_email_total = removed_phone_total = removed_domain_total = 0
+
+        # Per-file progress
+        file_bar = st.progress(0)
+        file_status = st.empty()
+        chunk_counter = 0
 
         try:
-            for chunk in pd.read_csv(f, dtype=str, chunksize=50000):
-
+            for chunk in pd.read_csv(
+                source_path,
+                dtype=str,
+                chunksize=CHUNK_SIZE,
+                sep=",",
+                engine="python",
+                on_bad_lines="skip"
+            ):
+                chunk_counter += 1
                 rows_before += len(chunk)
 
-                # capture actual column names
+                # Identify columns
                 for c in chunk.columns:
-                    cl = c.lower()
-                    if "email" in cl:  cols_found.append(c)
-                    if "phone" in cl:  cols_found.append(c)
-                    if "domain" in cl or "website" in cl or "url" in cl:
-                        cols_found.append(c)
+                    lc = c.lower()
+                    if "email" in lc: cols_found.append(c)
+                    if "phone" in lc: cols_found.append(c)
+                    if any(x in lc for x in ["domain", "website", "url"]): cols_found.append(c)
 
                 cleaned, rem_e, rem_p, rem_d = clean_chunk(chunk, suppression)
 
-                removed_email_total  += rem_e
-                removed_phone_total  += rem_p
+                removed_email_total += rem_e
+                removed_phone_total += rem_p
                 removed_domain_total += rem_d
 
-                cleaned.to_csv(tmp.name, index=False, mode="a", header=first)
-                first = False
+                cleaned.to_csv(out_path, index=False, mode="a", header=first_write)
+                first_write = False
+
+                # update chunk progress
+                file_bar.progress(min(100, chunk_counter * 5))
+                file_status.write(f"{uploaded.name}: processed {chunk_counter} chunks…")
 
                 del chunk, cleaned
                 gc.collect()
@@ -177,10 +210,10 @@ def process_files(files_to_clean, suppression):
             total_removed = removed_email_total + removed_phone_total + removed_domain_total
             rows_after = rows_before - total_removed
 
-            logs.append(f"✔ {f.name}: removed {total_removed} rows")
+            logs.append(f"✔ {uploaded.name}: removed {total_removed} rows")
 
             summary.append({
-                "File": f.name,
+                "File": uploaded.name,
                 "Identified Columns": ", ".join(sorted(set(cols_found))) or "None",
                 "Rows Before": rows_before,
                 "Rows After": rows_after,
@@ -190,24 +223,23 @@ def process_files(files_to_clean, suppression):
                 "Total Removed": total_removed
             })
 
-            with open(tmp.name, "r", encoding="utf-8") as result:
-                outputs[f.name] = result.read()
+            cleaned_paths[uploaded.name] = out_path
 
         except Exception as e:
-            logs.append(f"⚠️ {f.name} failed: {e}")
+            logs.append(f"⚠️ {uploaded.name} failed: {e}")
 
         finally:
-            try:
-                tmp.close()
-                os.remove(tmp.name)
-            except:
-                pass
+            # clean up uploaded temp file
+            try: os.remove(source_path)
+            except: pass
 
-    return pd.DataFrame(summary), logs, outputs
+    global_bar.progress(100)
+    global_status.write("All files processed.")
+    return pd.DataFrame(summary), logs, cleaned_paths
 
 
 # ============================================================
-#                      STREAMLIT UI
+# STREAMLIT UI
 # ============================================================
 st.set_page_config(page_title="CSV Cleaner", layout="wide")
 st.title("🧹 CSV Cleaner")
@@ -226,39 +258,29 @@ if st.button("Run Cleaning"):
 
         st.info("Loading suppression data…")
         suppression = load_suppression_data(sup_files)
-        for log in suppression["logs"]:
-            st.write(log)
+        for log in suppression["logs"]: st.write(log)
 
-        st.info("Processing cleaning files…")
-        summary_df, logs, cleaned_data = process_files(clean_files, suppression)
-        for log in logs:
-            st.write(log)
+        st.info("Processing files…")
+        summary_df, logs, cleaned_paths = process_files(clean_files, suppression)
+        for log in logs: st.write(log)
 
-        # ZIP progress
+        # Build ZIP from disk (memory-safe)
         st.info("Preparing ZIP…")
-        progress_text = st.empty()
-        progress_bar = st.progress(0)
-
         zip_buffer = io.BytesIO()
-        file_count = len(cleaned_data) + 1
-
         with ZipFile(zip_buffer, "w") as zf:
-            for i, (name, data) in enumerate(cleaned_data.items(), start=1):
-                progress_text.text(f"Adding {name} ({i}/{file_count})…")
-                zf.writestr(name, data)
-                progress_bar.progress(int(i / file_count * 100))
-
-            progress_text.text("Adding summary file…")
+            for name, path in cleaned_paths.items():
+                zf.write(path, arcname=name)
             zf.writestr("_Cleaning_Summary.csv", summary_df.to_csv(index=False))
-            progress_bar.progress(100)
 
         zip_buffer.seek(0)
-        progress_text.text("✅ ZIP ready!")
+
+        # Cleanup cleaned files
+        for p in cleaned_paths.values():
+            try: os.remove(p)
+            except: pass
 
         st.subheader("📊 Summary")
         st.dataframe(summary_df)
-
-        st.warning("⚠ After clicking download, the browser may pause briefly — this is normal.")
 
         st.download_button(
             "⬇️ Download Cleaned Files (ZIP)",
@@ -267,5 +289,4 @@ if st.button("Run Cleaning"):
             mime="application/zip"
         )
 
-        st.success("✨ Cleaning complete!")
-        st.write(f"⏱ Total time: {datetime.now() - start}")
+        st.success(f"✨ Cleaning complete! Total time: {datetime.now() - start}")
