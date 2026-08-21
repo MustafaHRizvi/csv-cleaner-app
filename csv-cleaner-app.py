@@ -20,9 +20,7 @@ _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 INTERNAL_DNC_DIR = os.environ.get("INTERNAL_DNC_DIR", os.path.join(_SCRIPT_DIR, "internal_dnc"))
 
 # tcpa_dnc_status labels — match HubSpot property values
-LABEL_INTERNAL_DNC  = "internal_dnc"
-LABEL_DNC_LIST      = "dnc_list"
-LABEL_TCPA_FLAGGED  = "tcpa_flagged"
+LABEL_INTERNAL_DNC = "internal_dnc"   # used for both internal DNC and uploaded suppression files
 
 
 # ============================================================
@@ -250,9 +248,9 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
                     dnc1.to_csv(dnc_path, index=False, mode="a", header=dnc_first)
                     dnc_first = False
 
-                # Pass 2 — uploaded suppression files
+                # Pass 2 — uploaded suppression files (same label as internal DNC)
                 if has_extra:
-                    chunk, dnc2, r2 = clean_chunk(chunk, extra_suppression, LABEL_DNC_LIST)
+                    chunk, dnc2, r2 = clean_chunk(chunk, extra_suppression, LABEL_INTERNAL_DNC)
                     rem_sup += r2
                     if not dnc2.empty:
                         dnc2.to_csv(dnc_path, index=False, mode="a", header=dnc_first)
@@ -341,7 +339,8 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
     phone_list = list(all_phones)
     st.write(f"  {len(phone_list):,} unique phone numbers to scrub")
 
-    flagged_phones: set[str] = set()
+    # phone -> tcpa_dnc_status label derived from API response
+    phone_status: dict[str, str] = {}
     total_batches = max(1, (len(phone_list) + TCPA_BATCH_SIZE - 1) // TCPA_BATCH_SIZE)
     tcpa_bar    = st.progress(0)
     tcpa_status = st.empty()
@@ -353,12 +352,21 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
             results = scrub_tcpa_batch(batch, user, password)
             for phone, result in results.items():
                 if str(result.get("clean", "1")) == "0":
-                    flagged_phones.add(phone)
+                    # Build status label from API response fields
+                    status = (
+                        result.get("litigator_type")
+                        or result.get("type")
+                        or result.get("list_type")
+                        or result.get("status")
+                        or "tcpa_flagged"
+                    )
+                    phone_status[phone] = str(status).strip()
         except Exception as exc:
             st.warning(f"Batch {i} failed: {exc}")
         tcpa_bar.progress(int(i / total_batches * 100))
 
     tcpa_bar.progress(100)
+    flagged_phones = set(phone_status.keys())
     st.write(f"  {len(flagged_phones):,} phone numbers flagged by TCPA")
 
     if not flagged_phones:
@@ -373,7 +381,6 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
         new_clean_path = new_clean_tmp.name; new_clean_tmp.close()
 
         clean_first = True
-        # check if dnc file already has rows (to know if header was written)
         dnc_has_rows = os.path.exists(dnc_path) and os.path.getsize(dnc_path) > 0
         tcpa_removed = 0
 
@@ -382,12 +389,19 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
                                      engine="python", on_bad_lines="skip"):
                 phone_cols = [c for c in chunk.columns if "phone" in c.lower()]
                 mask_flag = pd.Series(False, index=chunk.index)
+                matched_phone: pd.Series = pd.Series("", index=chunk.index)
                 for col in phone_cols:
-                    mask_flag |= chunk[col].map(clean_phone).isin(flagged_phones)
+                    cleaned = chunk[col].map(clean_phone)
+                    hits = cleaned.isin(flagged_phones)
+                    mask_flag |= hits
+                    # record the first matched phone per row for status lookup
+                    matched_phone = matched_phone.where(matched_phone != "" , cleaned.where(hits, ""))
 
                 flagged_chunk = chunk[mask_flag].copy()
                 if not flagged_chunk.empty:
-                    flagged_chunk["tcpa_dnc_status"] = LABEL_TCPA_FLAGGED
+                    flagged_chunk["tcpa_dnc_status"] = (
+                        matched_phone[mask_flag].map(lambda p: phone_status.get(p, "tcpa_flagged"))
+                    )
                     flagged_chunk.to_csv(dnc_path, index=False, mode="a", header=not dnc_has_rows)
                     dnc_has_rows = True
 
