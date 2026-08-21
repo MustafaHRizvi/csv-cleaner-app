@@ -16,13 +16,17 @@ TCPA_BATCH_SIZE = 3_000
 TCPA_USER       = os.environ.get("TCPA_USER", "")
 TCPA_PASS       = os.environ.get("TCPA_PASS", "")
 
-# Internal DNC folder: set INTERNAL_DNC_DIR env var, or defaults to internal_dnc/ next to this script
 _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 INTERNAL_DNC_DIR = os.environ.get("INTERNAL_DNC_DIR", os.path.join(_SCRIPT_DIR, "internal_dnc"))
 
+# tcpa_dnc_status labels — match HubSpot property values
+LABEL_INTERNAL_DNC  = "internal_dnc"
+LABEL_DNC_LIST      = "dnc_list"
+LABEL_TCPA_FLAGGED  = "tcpa_flagged"
+
 
 # ============================================================
-# SAVE UPLOADED FILE TO DISK (crucial for memory safety)
+# SAVE UPLOADED FILE TO DISK
 # ============================================================
 def save_uploaded_to_disk(uploaded_file):
     suffix = os.path.splitext(uploaded_file.name)[1] or ".csv"
@@ -34,7 +38,7 @@ def save_uploaded_to_disk(uploaded_file):
 
 
 # ============================================================
-# CASE-INSENSITIVE COLUMN FINDER
+# COLUMN FINDER
 # ============================================================
 def find_col(df, patterns):
     for col in df.columns:
@@ -64,10 +68,6 @@ def clean_domain(value):
     if not ext.domain: return None
     return f"{ext.domain}.{ext.suffix}"
 
-
-# ============================================================
-# NORMALIZE SUPPRESSION EMAILS
-# ============================================================
 def normalize_suppression_email(e):
     if pd.isna(e): return None
     e = str(e).strip().lower()
@@ -78,7 +78,6 @@ def normalize_suppression_email(e):
 
 # ============================================================
 # LOAD INTERNAL DNC (server-side folder)
-# Expects: Emails.csv (col: Email), Phones.csv (col: Phone), Domains.csv (col: Domain)
 # ============================================================
 def load_internal_dnc():
     emails, phones, domains = set(), set(), set()
@@ -107,8 +106,7 @@ def load_internal_dnc():
             if col is None:
                 logs.append(f"⚠️ {filename}: no usable column found")
                 continue
-            values = df[col].dropna().map(normalise)
-            values = values.dropna()
+            values = df[col].dropna().map(normalise).dropna()
             target_set.update(values)
             logs.append(f"✅ Internal DNC / {filename}: {len(target_set):,} entries loaded")
         except Exception as exc:
@@ -131,7 +129,6 @@ def load_suppression_data(files):
         try:
             df = pd.read_csv(f, dtype=str, nrows=200000)
             found = []
-
             for c in df.columns:
                 lc = c.lower()
                 if "email" in lc:
@@ -143,9 +140,7 @@ def load_suppression_data(files):
                 elif any(x in lc for x in ["domain", "website", "url"]):
                     domains.update(df[c].dropna().map(clean_domain))
                     found.append(c)
-
             logs.append(f"✅ {getattr(f,'name',f)}: found {', '.join(found) if found else 'no usable columns'}")
-
         except Exception as e:
             logs.append(f"⚠️ {getattr(f,'name',f)} skipped: {e}")
 
@@ -156,11 +151,11 @@ def load_suppression_data(files):
 
 
 # ============================================================
-# CLEAN ONE CHUNK AGAINST ONE SUPPRESSION SET
-# Returns (cleaned_df, removed_email, removed_phone, removed_domain)
+# CLEAN ONE CHUNK — returns (clean_df, dnc_df)
+# dnc_df has tcpa_dnc_status column set to label
 # ============================================================
-def clean_chunk(df, suppression):
-    removed_email = removed_phone = removed_domain = 0
+def clean_chunk(df, suppression, label):
+    mask_keep = pd.Series(True, index=df.index)
 
     # ---- Email ----
     strict_email_col = find_col(df, ["email"])
@@ -173,38 +168,35 @@ def clean_chunk(df, suppression):
             email_cols.append(c)
 
     for col in email_cols:
-        df["__email"] = df[col].map(clean_email)
-        before = len(df)
-        df = df[~df["__email"].isin(suppression["emails"])]
-        removed_email += before - len(df)
+        cleaned = df[col].map(clean_email)
+        mask_keep &= ~cleaned.isin(suppression["emails"])
 
     # ---- Phone ----
-    phone_cols = [c for c in df.columns if "phone" in c.lower()]
-    for col in phone_cols:
-        df["__phone"] = df[col].map(clean_phone)
-        before = len(df)
-        df = df[~df["__phone"].isin(suppression["phones"])]
-        removed_phone += before - len(df)
+    for col in [c for c in df.columns if "phone" in c.lower()]:
+        cleaned = df[col].map(clean_phone)
+        mask_keep &= ~cleaned.isin(suppression["phones"])
 
     # ---- Domain ----
-    domain_cols = [c for c in df.columns if any(x in c.lower() for x in ["domain", "website", "url"])]
-    for col in domain_cols:
-        df["__domain"] = df[col].map(clean_domain)
-        before = len(df)
-        df = df[~df["__domain"].isin(suppression["domains"])]
-        removed_domain += before - len(df)
+    for col in [c for c in df.columns if any(x in c.lower() for x in ["domain", "website", "url"])]:
+        cleaned = df[col].map(clean_domain)
+        mask_keep &= ~cleaned.isin(suppression["domains"])
 
-    df = df[[c for c in df.columns if not c.startswith("__")]]
-    return df, removed_email, removed_phone, removed_domain
+    clean_df = df[mask_keep].copy()
+    dnc_df   = df[~mask_keep].copy()
+    if not dnc_df.empty:
+        dnc_df["tcpa_dnc_status"] = label
+
+    removed = (~mask_keep).sum()
+    return clean_df, dnc_df, removed
 
 
 # ============================================================
 # MEMORY-SAFE THREE-PASS PROCESSOR
-# Pass 1: Internal DNC  → Pass 2: Uploaded suppression files → Pass 3: TCPA (later)
 # ============================================================
 def process_files(files_to_clean, internal_dnc, extra_suppression):
     summary, logs = [], []
-    cleaned_paths = {}
+    clean_paths = {}   # name -> temp path for CLEAR file
+    dnc_paths   = {}   # name -> temp path for DNC file
 
     has_extra = bool(
         extra_suppression["emails"] or
@@ -222,15 +214,16 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
 
         source_path = save_uploaded_to_disk(uploaded)
 
-        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        out_path = out_tmp.name
-        out_tmp.close()
+        clean_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        clean_path = clean_tmp.name; clean_tmp.close()
 
-        first_write = True
+        dnc_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        dnc_path = dnc_tmp.name; dnc_tmp.close()
+
+        clean_first = dnc_first = True
         rows_before = 0
         cols_found  = []
-        rem_idnc_e = rem_idnc_p = rem_idnc_d = 0
-        rem_sup_e  = rem_sup_p  = rem_sup_d  = 0
+        rem_idnc = rem_sup = 0
 
         file_bar    = st.progress(0)
         file_status = st.empty()
@@ -251,16 +244,22 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
                     if any(x in lc for x in ["domain", "website", "url"]): cols_found.append(c)
 
                 # Pass 1 — Internal DNC
-                chunk, e1, p1, d1 = clean_chunk(chunk, internal_dnc)
-                rem_idnc_e += e1; rem_idnc_p += p1; rem_idnc_d += d1
+                chunk, dnc1, r1 = clean_chunk(chunk, internal_dnc, LABEL_INTERNAL_DNC)
+                rem_idnc += r1
+                if not dnc1.empty:
+                    dnc1.to_csv(dnc_path, index=False, mode="a", header=dnc_first)
+                    dnc_first = False
 
-                # Pass 2 — uploaded suppression files (only rows that survived pass 1)
+                # Pass 2 — uploaded suppression files
                 if has_extra:
-                    chunk, e2, p2, d2 = clean_chunk(chunk, extra_suppression)
-                    rem_sup_e += e2; rem_sup_p += p2; rem_sup_d += d2
+                    chunk, dnc2, r2 = clean_chunk(chunk, extra_suppression, LABEL_DNC_LIST)
+                    rem_sup += r2
+                    if not dnc2.empty:
+                        dnc2.to_csv(dnc_path, index=False, mode="a", header=dnc_first)
+                        dnc_first = False
 
-                chunk.to_csv(out_path, index=False, mode="a", header=first_write)
-                first_write = False
+                chunk.to_csv(clean_path, index=False, mode="a", header=clean_first)
+                clean_first = False
 
                 file_bar.progress(min(100, chunk_counter * 5))
                 file_status.write(f"{uploaded.name}: processed {chunk_counter} chunks…")
@@ -268,23 +267,22 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
                 del chunk
                 gc.collect()
 
-            total_idnc    = rem_idnc_e + rem_idnc_p + rem_idnc_d
-            total_sup     = rem_sup_e  + rem_sup_p  + rem_sup_d
-            total_removed = total_idnc + total_sup
+            total_removed = rem_idnc + rem_sup
             rows_after    = rows_before - total_removed
-            logs.append(f"✔ {uploaded.name}: {total_idnc:,} removed by Internal DNC, {total_sup:,} by suppression files")
+            logs.append(f"✔ {uploaded.name}: {rem_idnc:,} internal DNC, {rem_sup:,} suppression list")
 
             summary.append({
-                "File":                      uploaded.name,
-                "Identified Columns":        ", ".join(sorted(set(cols_found))) or "None",
-                "Rows Before":               rows_before,
-                "Removed by Internal DNC":   total_idnc,
-                "Removed by Suppression":    total_sup,
-                "Removed by TCPA":           0,
-                "Total Removed":             total_removed,
-                "Rows After":                rows_after,
+                "File":                    uploaded.name,
+                "Identified Columns":      ", ".join(sorted(set(cols_found))) or "None",
+                "Rows Before":             rows_before,
+                "Removed by Internal DNC": rem_idnc,
+                "Removed by Suppression":  rem_sup,
+                "Removed by TCPA":         0,
+                "Total Removed":           total_removed,
+                "Rows After":              rows_after,
             })
-            cleaned_paths[uploaded.name] = out_path
+            clean_paths[uploaded.name] = clean_path
+            dnc_paths[uploaded.name]   = dnc_path
 
         except Exception as e:
             logs.append(f"⚠️ {uploaded.name} failed: {e}")
@@ -295,7 +293,7 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
 
     global_bar.progress(100)
     global_status.write("Cleaning complete.")
-    return pd.DataFrame(summary), logs, cleaned_paths
+    return pd.DataFrame(summary), logs, clean_paths, dnc_paths
 
 
 # ============================================================
@@ -316,22 +314,19 @@ def _tcpa_post(phones_batch, user, password, base_url):
         return {item["phone_number"]: item for item in data["results"]}
     return {}
 
-
 def scrub_tcpa_batch(phones_batch, user, password):
     try:
         return _tcpa_post(phones_batch, user, password, TCPA_BASE_URL)
     except Exception:
         return _tcpa_post(phones_batch, user, password, TCPA_BACKUP_URL)
 
-
-def collect_phones_from_files(cleaned_paths):
+def collect_phones_from_files(clean_paths):
     all_phones: set[str] = set()
-    for path in cleaned_paths.values():
+    for path in clean_paths.values():
         try:
             for chunk in pd.read_csv(path, dtype=str, chunksize=CHUNK_SIZE,
                                      engine="python", on_bad_lines="skip"):
-                phone_cols = [c for c in chunk.columns if "phone" in c.lower()]
-                for col in phone_cols:
+                for col in [c for c in chunk.columns if "phone" in c.lower()]:
                     all_phones.update(chunk[col].dropna().map(clean_phone).dropna())
         except Exception:
             pass
@@ -340,9 +335,9 @@ def collect_phones_from_files(cleaned_paths):
     return all_phones
 
 
-def tcpa_scrub_cleaned_files(cleaned_paths, summary_df, user, password):
+def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password):
     st.info("Collecting phone numbers from cleaned files…")
-    all_phones = collect_phones_from_files(cleaned_paths)
+    all_phones = collect_phones_from_files(clean_paths)
     phone_list = list(all_phones)
     st.write(f"  {len(phone_list):,} unique phone numbers to scrub")
 
@@ -370,42 +365,53 @@ def tcpa_scrub_cleaned_files(cleaned_paths, summary_df, user, password):
         st.write("  No TCPA-flagged numbers — no rows removed.")
         return summary_df
 
-    for name, path in list(cleaned_paths.items()):
-        out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        out_path = out_tmp.name
-        out_tmp.close()
+    for name in list(clean_paths.keys()):
+        clean_path = clean_paths[name]
+        dnc_path   = dnc_paths[name]
 
-        first_write  = True
+        new_clean_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        new_clean_path = new_clean_tmp.name; new_clean_tmp.close()
+
+        clean_first = True
+        # check if dnc file already has rows (to know if header was written)
+        dnc_has_rows = os.path.exists(dnc_path) and os.path.getsize(dnc_path) > 0
         tcpa_removed = 0
 
         try:
-            for chunk in pd.read_csv(path, dtype=str, chunksize=CHUNK_SIZE,
+            for chunk in pd.read_csv(clean_path, dtype=str, chunksize=CHUNK_SIZE,
                                      engine="python", on_bad_lines="skip"):
                 phone_cols = [c for c in chunk.columns if "phone" in c.lower()]
-                before = len(chunk)
+                mask_flag = pd.Series(False, index=chunk.index)
                 for col in phone_cols:
-                    chunk["__phone"] = chunk[col].map(clean_phone)
-                    chunk = chunk[~chunk["__phone"].isin(flagged_phones)]
-                chunk = chunk[[c for c in chunk.columns if not c.startswith("__")]]
-                tcpa_removed += before - len(chunk)
-                chunk.to_csv(out_path, index=False, mode="a", header=first_write)
-                first_write = False
+                    mask_flag |= chunk[col].map(clean_phone).isin(flagged_phones)
+
+                flagged_chunk = chunk[mask_flag].copy()
+                if not flagged_chunk.empty:
+                    flagged_chunk["tcpa_dnc_status"] = LABEL_TCPA_FLAGGED
+                    flagged_chunk.to_csv(dnc_path, index=False, mode="a", header=not dnc_has_rows)
+                    dnc_has_rows = True
+
+                clean_chunk_out = chunk[~mask_flag]
+                clean_chunk_out.to_csv(new_clean_path, index=False, mode="a", header=clean_first)
+                clean_first = False
+
+                tcpa_removed += mask_flag.sum()
                 del chunk
                 gc.collect()
 
-            os.remove(path)
-            cleaned_paths[name] = out_path
+            os.remove(clean_path)
+            clean_paths[name] = new_clean_path
 
             mask = summary_df["File"] == name
-            summary_df.loc[mask, "Removed by TCPA"]  = tcpa_removed
-            summary_df.loc[mask, "Total Removed"]    += tcpa_removed
-            summary_df.loc[mask, "Rows After"]       -= tcpa_removed
+            summary_df.loc[mask, "Removed by TCPA"] = tcpa_removed
+            summary_df.loc[mask, "Total Removed"]   += tcpa_removed
+            summary_df.loc[mask, "Rows After"]      -= tcpa_removed
 
             st.write(f"  ✔ {name}: {tcpa_removed:,} rows removed by TCPA")
 
         except Exception as exc:
             st.warning(f"  ⚠️ {name} TCPA pass failed: {exc}")
-            try: os.remove(out_path)
+            try: os.remove(new_clean_path)
             except: pass
 
     return summary_df
@@ -452,7 +458,7 @@ if st.button("Run Cleaning"):
                 st.write(log)
 
         st.info("Running suppression passes…")
-        summary_df, logs, cleaned_paths = process_files(
+        summary_df, logs, clean_paths, dnc_paths = process_files(
             clean_files, internal_dnc, extra_suppression
         )
         for log in logs:
@@ -461,18 +467,21 @@ if st.button("Run Cleaning"):
         if enable_tcpa:
             st.info("Running TCPA phone scrub…")
             summary_df = tcpa_scrub_cleaned_files(
-                cleaned_paths, summary_df, TCPA_USER, TCPA_PASS
+                clean_paths, dnc_paths, summary_df, TCPA_USER, TCPA_PASS
             )
 
         st.info("Preparing ZIP…")
         zip_buffer = io.BytesIO()
         with ZipFile(zip_buffer, "w") as zf:
-            for name, path in cleaned_paths.items():
-                zf.write(path, arcname=name)
+            for name, path in clean_paths.items():
+                zf.write(path, arcname=f"CLEAR_{name}")
+            for name, path in dnc_paths.items():
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    zf.write(path, arcname=f"DNC_{name}")
             zf.writestr("_Cleaning_Summary.csv", summary_df.to_csv(index=False))
         zip_buffer.seek(0)
 
-        for p in cleaned_paths.values():
+        for p in list(clean_paths.values()) + list(dnc_paths.values()):
             try: os.remove(p)
             except: pass
 
