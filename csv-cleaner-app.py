@@ -352,15 +352,13 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
             results = scrub_tcpa_batch(batch, user, password)
             for phone, result in results.items():
                 if str(result.get("clean", "1")) == "0":
-                    # Build status label from API response fields
-                    status = (
-                        result.get("litigator_type")
-                        or result.get("type")
-                        or result.get("list_type")
-                        or result.get("status")
-                        or "tcpa_flagged"
-                    )
-                    phone_status[phone] = str(status).strip()
+                    # Mirror build_value() from tcpa_tag_hubspot.py
+                    vals = []
+                    if result.get("on_federal_dnc") == "Y": vals.append("federal_dnc")
+                    if result.get("on_state_dnc")   == "Y": vals.append("state_dnc")
+                    if result.get("on_tcpa")         == "Y": vals.append("tcpa_litigator")
+                    if result.get("on_complainers")  == "Y": vals.append("complainer")
+                    phone_status[phone] = ";".join(vals) if vals else "federal_dnc"
         except Exception as exc:
             st.warning(f"Batch {i} failed: {exc}")
         tcpa_bar.progress(int(i / total_batches * 100))
