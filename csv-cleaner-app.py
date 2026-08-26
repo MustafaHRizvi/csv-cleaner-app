@@ -58,6 +58,8 @@ def clean_email(email):
 def clean_phone(phone):
     if pd.isna(phone): return None
     digits = re.sub(r"\D", "", str(phone))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
     return digits if digits else None
 
 def clean_domain(value):
