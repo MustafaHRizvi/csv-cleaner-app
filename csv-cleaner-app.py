@@ -195,8 +195,9 @@ def clean_chunk(df, suppression, label):
 # ============================================================
 def process_files(files_to_clean, internal_dnc, extra_suppression):
     summary, logs = [], []
-    clean_paths = {}   # name -> temp path for CLEAR file
-    dnc_paths   = {}   # name -> temp path for DNC file
+    clean_paths         = {}   # name -> temp path for CLEAR file
+    tcpa_internal_paths = {}   # name -> temp path for TCPA+Internal file
+    dnc_paths           = {}   # name -> temp path for DNC file (federal/state/complainer)
 
     has_extra = bool(
         extra_suppression["emails"] or
@@ -217,10 +218,13 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
         clean_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
         clean_path = clean_tmp.name; clean_tmp.close()
 
+        ti_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        ti_path = ti_tmp.name; ti_tmp.close()
+
         dnc_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
         dnc_path = dnc_tmp.name; dnc_tmp.close()
 
-        clean_first = dnc_first = True
+        clean_first = ti_first = True
         rows_before = 0
         cols_found  = []
         rem_idnc = rem_sup = 0
@@ -243,20 +247,20 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
                     if "phone" in lc: cols_found.append(c)
                     if any(x in lc for x in ["domain", "website", "url"]): cols_found.append(c)
 
-                # Pass 1 — Internal DNC
+                # Pass 1 — Internal DNC → TCPA+Internal file
                 chunk, dnc1, r1 = clean_chunk(chunk, internal_dnc, LABEL_INTERNAL_DNC)
                 rem_idnc += r1
                 if not dnc1.empty:
-                    dnc1.to_csv(dnc_path, index=False, mode="a", header=dnc_first)
-                    dnc_first = False
+                    dnc1.to_csv(ti_path, index=False, mode="a", header=ti_first)
+                    ti_first = False
 
-                # Pass 2 — uploaded suppression files (same label as internal DNC)
+                # Pass 2 — uploaded suppression files → TCPA+Internal file
                 if has_extra:
                     chunk, dnc2, r2 = clean_chunk(chunk, extra_suppression, LABEL_INTERNAL_DNC)
                     rem_sup += r2
                     if not dnc2.empty:
-                        dnc2.to_csv(dnc_path, index=False, mode="a", header=dnc_first)
-                        dnc_first = False
+                        dnc2.to_csv(ti_path, index=False, mode="a", header=ti_first)
+                        ti_first = False
 
                 chunk.to_csv(clean_path, index=False, mode="a", header=clean_first)
                 clean_first = False
@@ -272,17 +276,19 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
             logs.append(f"✔ {uploaded.name}: {rem_idnc:,} internal DNC, {rem_sup:,} suppression list")
 
             summary.append({
-                "File":                    uploaded.name,
-                "Identified Columns":      ", ".join(sorted(set(cols_found))) or "None",
-                "Rows Before":             rows_before,
-                "Removed by Internal DNC": rem_idnc,
-                "Removed by Suppression":  rem_sup,
-                "Removed by TCPA":         0,
-                "Total Removed":           total_removed,
-                "Rows After":              rows_after,
+                "File":                      uploaded.name,
+                "Identified Columns":        ", ".join(sorted(set(cols_found))) or "None",
+                "Rows Before":               rows_before,
+                "Removed by Internal DNC":   rem_idnc,
+                "Removed by Suppression":    rem_sup,
+                "Removed by TCPA Litigator": 0,
+                "Removed by DNC (API)":      0,
+                "Total Removed":             total_removed,
+                "Rows After":                rows_after,
             })
-            clean_paths[uploaded.name] = clean_path
-            dnc_paths[uploaded.name]   = dnc_path
+            clean_paths[uploaded.name]         = clean_path
+            tcpa_internal_paths[uploaded.name] = ti_path
+            dnc_paths[uploaded.name]           = dnc_path
 
         except Exception as e:
             logs.append(f"⚠️ {uploaded.name} failed: {e}")
@@ -293,7 +299,7 @@ def process_files(files_to_clean, internal_dnc, extra_suppression):
 
     global_bar.progress(100)
     global_status.write("Cleaning complete.")
-    return pd.DataFrame(summary), logs, clean_paths, dnc_paths
+    return pd.DataFrame(summary), logs, clean_paths, tcpa_internal_paths, dnc_paths
 
 
 # ============================================================
@@ -335,7 +341,7 @@ def collect_phones_from_files(clean_paths):
     return all_phones
 
 
-def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password):
+def tcpa_scrub_cleaned_files(clean_paths, tcpa_internal_paths, dnc_paths, summary_df, user, password):
     st.info("Collecting phone numbers from cleaned files…")
     all_phones = collect_phones_from_files(clean_paths)
     phone_list = list(all_phones)
@@ -354,10 +360,8 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
             results = scrub_tcpa_batch(batch, user, password)
             for phone, result in results.items():
                 if str(result.get("clean", "1")) == "0":
-                    # Prefer status_array from API response; fall back to on_* fields
                     status_array = result.get("status_array") or []
                     if status_array:
-                        # Map API values to HubSpot property values
                         mapping = {
                             "federal_dnc":  "federal_dnc",
                             "state_dnc":    "state_dnc",
@@ -387,53 +391,76 @@ def tcpa_scrub_cleaned_files(clean_paths, dnc_paths, summary_df, user, password)
 
     for name in list(clean_paths.keys()):
         clean_path = clean_paths[name]
+        ti_path    = tcpa_internal_paths[name]
         dnc_path   = dnc_paths[name]
 
         new_clean_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
         new_clean_path = new_clean_tmp.name; new_clean_tmp.close()
 
-        clean_first = True
+        clean_first  = True
+        ti_has_rows  = os.path.exists(ti_path)  and os.path.getsize(ti_path)  > 0
         dnc_has_rows = os.path.exists(dnc_path) and os.path.getsize(dnc_path) > 0
-        tcpa_removed = 0
+        rem_litigator = rem_dnc_api = 0
 
         try:
             for chunk in pd.read_csv(clean_path, dtype=str, chunksize=CHUNK_SIZE,
                                      engine="python", on_bad_lines="skip"):
                 phone_cols = [c for c in chunk.columns if "phone" in c.lower()]
-                mask_flag = pd.Series(False, index=chunk.index)
-                matched_phone: pd.Series = pd.Series("", index=chunk.index)
+                mask_flag     = pd.Series(False, index=chunk.index)
+                matched_phone = pd.Series("",    index=chunk.index)
                 for col in phone_cols:
                     cleaned = chunk[col].map(clean_phone)
                     hits = cleaned.isin(flagged_phones)
-                    mask_flag |= hits
-                    # record the first matched phone per row for status lookup
-                    matched_phone = matched_phone.where(matched_phone != "" , cleaned.where(hits, ""))
+                    mask_flag    |= hits
+                    matched_phone = matched_phone.where(
+                        matched_phone != "", cleaned.where(hits, "")
+                    )
 
                 flagged_chunk = chunk[mask_flag].copy()
                 if not flagged_chunk.empty:
                     flagged_chunk["tcpa_dnc_status"] = (
-                        matched_phone[mask_flag].map(lambda p: phone_status.get(p, "tcpa_flagged"))
+                        matched_phone[mask_flag].map(
+                            lambda p: phone_status.get(p, "federal_dnc")
+                        )
                     )
-                    flagged_chunk.to_csv(dnc_path, index=False, mode="a", header=not dnc_has_rows)
-                    dnc_has_rows = True
+                    # Split: tcpa_litigator → TCPA+Internal; everything else → DNC
+                    mask_litigator = flagged_chunk["tcpa_dnc_status"].str.contains(
+                        "tcpa_litigator", na=False
+                    )
+                    ti_chunk  = flagged_chunk[mask_litigator]
+                    dnc_chunk = flagged_chunk[~mask_litigator]
+
+                    if not ti_chunk.empty:
+                        ti_chunk.to_csv(ti_path, index=False, mode="a", header=not ti_has_rows)
+                        ti_has_rows = True
+                        rem_litigator += len(ti_chunk)
+
+                    if not dnc_chunk.empty:
+                        dnc_chunk.to_csv(dnc_path, index=False, mode="a", header=not dnc_has_rows)
+                        dnc_has_rows = True
+                        rem_dnc_api += len(dnc_chunk)
 
                 clean_chunk_out = chunk[~mask_flag]
                 clean_chunk_out.to_csv(new_clean_path, index=False, mode="a", header=clean_first)
                 clean_first = False
 
-                tcpa_removed += mask_flag.sum()
                 del chunk
                 gc.collect()
 
             os.remove(clean_path)
             clean_paths[name] = new_clean_path
 
+            tcpa_removed = rem_litigator + rem_dnc_api
             mask = summary_df["File"] == name
-            summary_df.loc[mask, "Removed by TCPA"] = tcpa_removed
-            summary_df.loc[mask, "Total Removed"]   += tcpa_removed
-            summary_df.loc[mask, "Rows After"]      -= tcpa_removed
+            summary_df.loc[mask, "Removed by TCPA Litigator"] = rem_litigator
+            summary_df.loc[mask, "Removed by DNC (API)"]      = rem_dnc_api
+            summary_df.loc[mask, "Total Removed"]             += tcpa_removed
+            summary_df.loc[mask, "Rows After"]                -= tcpa_removed
 
-            st.write(f"  ✔ {name}: {tcpa_removed:,} rows removed by TCPA")
+            st.write(
+                f"  ✔ {name}: {rem_litigator:,} TCPA litigator, "
+                f"{rem_dnc_api:,} DNC (federal/state/complainer)"
+            )
 
         except Exception as exc:
             st.warning(f"  ⚠️ {name} TCPA pass failed: {exc}")
@@ -484,7 +511,7 @@ if st.button("Run Cleaning"):
                 st.write(log)
 
         st.info("Running suppression passes…")
-        summary_df, logs, clean_paths, dnc_paths = process_files(
+        summary_df, logs, clean_paths, tcpa_internal_paths, dnc_paths = process_files(
             clean_files, internal_dnc, extra_suppression
         )
         for log in logs:
@@ -493,7 +520,7 @@ if st.button("Run Cleaning"):
         if enable_tcpa:
             st.info("Running TCPA phone scrub…")
             summary_df = tcpa_scrub_cleaned_files(
-                clean_paths, dnc_paths, summary_df, TCPA_USER, TCPA_PASS
+                clean_paths, tcpa_internal_paths, dnc_paths, summary_df, TCPA_USER, TCPA_PASS
             )
 
         st.info("Preparing ZIP…")
@@ -501,13 +528,16 @@ if st.button("Run Cleaning"):
         with ZipFile(zip_buffer, "w") as zf:
             for name, path in clean_paths.items():
                 zf.write(path, arcname=f"CLEAR_{name}")
+            for name, path in tcpa_internal_paths.items():
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    zf.write(path, arcname=f"TCPA+Internal_{name}")
             for name, path in dnc_paths.items():
                 if os.path.exists(path) and os.path.getsize(path) > 0:
                     zf.write(path, arcname=f"DNC_{name}")
             zf.writestr("_Cleaning_Summary.csv", summary_df.to_csv(index=False))
         zip_buffer.seek(0)
 
-        for p in list(clean_paths.values()) + list(dnc_paths.values()):
+        for p in list(clean_paths.values()) + list(tcpa_internal_paths.values()) + list(dnc_paths.values()):
             try: os.remove(p)
             except: pass
 
