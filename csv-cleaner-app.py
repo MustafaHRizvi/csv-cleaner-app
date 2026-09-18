@@ -129,35 +129,58 @@ def load_internal_dnc():
 # ============================================================
 # REFRESH INTERNAL DNC FROM GOOGLE DRIVE
 # ============================================================
+def _count_rows(path):
+    """Return data row count (excluding header) or None if file doesn't exist."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in f) - 1  # subtract header
+    except Exception:
+        return None
+
+
 def refresh_internal_dnc_from_drive():
     missing = [name for name, fid in DRIVE_FILE_IDS.items() if not fid]
     if missing:
-        return False, f"Drive file IDs not configured for: {', '.join(missing)}"
+        return False, [], f"Drive file IDs not configured for: {', '.join(missing)}"
 
     os.makedirs(INTERNAL_DNC_DIR, exist_ok=True)
-    logs = []
+    results = []  # list of dicts for the summary table
+    error_msg = None
 
     for filename, file_id in DRIVE_FILE_IDS.items():
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        url  = f"https://drive.google.com/uc?export=download&id={file_id}"
         dest = os.path.join(INTERNAL_DNC_DIR, filename)
+        rows_before = _count_rows(dest)
+
         try:
             resp = requests.get(url, timeout=60, allow_redirects=True)
             resp.raise_for_status()
-            # Drive sometimes wraps large files in a virus-scan confirmation page
             if b"virus scan warning" in resp.content[:2000].lower():
-                # Follow the confirm link
                 confirm_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
                 resp = requests.get(confirm_url, timeout=60, allow_redirects=True)
                 resp.raise_for_status()
             with open(dest, "wb") as f:
                 f.write(resp.content)
-            size_kb = len(resp.content) // 1024
-            logs.append(f"✅ {filename}: {size_kb:,} KB written to disk")
+            rows_after = _count_rows(dest)
+            results.append({
+                "File":         filename,
+                "Rows Before":  rows_before if rows_before is not None else "—",
+                "Rows After":   rows_after  if rows_after  is not None else "—",
+                "Status":       "✅ Updated",
+            })
         except Exception as exc:
-            logs.append(f"⚠️ {filename} failed: {exc}")
-            return False, "\n".join(logs)
+            results.append({
+                "File":        filename,
+                "Rows Before": rows_before if rows_before is not None else "—",
+                "Rows After":  "—",
+                "Status":      f"⚠️ Failed: {exc}",
+            })
+            error_msg = str(exc)
 
-    return True, "\n".join(logs)
+    ok = error_msg is None
+    return ok, results, error_msg
 
 
 # ============================================================
@@ -607,10 +630,10 @@ with st.expander("🔧 Admin — Refresh Internal DNC Files"):
                 st.error("Incorrect password.")
             else:
                 with st.spinner("Downloading files from Google Drive…"):
-                    ok, msg = refresh_internal_dnc_from_drive()
-                for line in msg.splitlines():
-                    st.write(line)
+                    ok, results, _ = refresh_internal_dnc_from_drive()
+                if results:
+                    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
                 if ok:
                     st.success("Internal DNC files updated successfully.")
                 else:
-                    st.error("One or more files failed to download — check logs above.")
+                    st.error("One or more files failed to download — see table above.")
