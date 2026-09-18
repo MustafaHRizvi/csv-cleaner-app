@@ -15,9 +15,17 @@ TCPA_BACKUP_URL = "https://api101.tcpalitigatorlist.com"
 TCPA_BATCH_SIZE = 3_000
 TCPA_USER       = os.environ.get("TCPA_USER", "")
 TCPA_PASS       = os.environ.get("TCPA_PASS", "")
+ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", "")
 
 _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 INTERNAL_DNC_DIR = os.environ.get("INTERNAL_DNC_DIR", os.path.join(_SCRIPT_DIR, "internal_dnc"))
+
+# Google Drive file IDs for the three internal DNC files
+DRIVE_FILE_IDS = {
+    "Emails.csv":  os.environ.get("EMAILS_DRIVE_ID", ""),
+    "Phones.csv":  os.environ.get("PHONES_DRIVE_ID", ""),
+    "Domains.csv": os.environ.get("DOMAINS_DRIVE_ID", ""),
+}
 
 # tcpa_dnc_status labels — match HubSpot property values
 LABEL_INTERNAL_DNC = "internal_dnc"   # used for both internal DNC and uploaded suppression files
@@ -116,6 +124,40 @@ def load_internal_dnc():
     phones.discard(None)
     domains.discard(None)
     return {"emails": emails, "phones": phones, "domains": domains, "logs": logs}
+
+
+# ============================================================
+# REFRESH INTERNAL DNC FROM GOOGLE DRIVE
+# ============================================================
+def refresh_internal_dnc_from_drive():
+    missing = [name for name, fid in DRIVE_FILE_IDS.items() if not fid]
+    if missing:
+        return False, f"Drive file IDs not configured for: {', '.join(missing)}"
+
+    os.makedirs(INTERNAL_DNC_DIR, exist_ok=True)
+    logs = []
+
+    for filename, file_id in DRIVE_FILE_IDS.items():
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        dest = os.path.join(INTERNAL_DNC_DIR, filename)
+        try:
+            resp = requests.get(url, timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+            # Drive sometimes wraps large files in a virus-scan confirmation page
+            if b"virus scan warning" in resp.content[:2000].lower():
+                # Follow the confirm link
+                confirm_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                resp = requests.get(confirm_url, timeout=60, allow_redirects=True)
+                resp.raise_for_status()
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+            size_kb = len(resp.content) // 1024
+            logs.append(f"✅ {filename}: {size_kb:,} KB written to disk")
+        except Exception as exc:
+            logs.append(f"⚠️ {filename} failed: {exc}")
+            return False, "\n".join(logs)
+
+    return True, "\n".join(logs)
 
 
 # ============================================================
@@ -552,3 +594,23 @@ if st.button("Run Cleaning"):
         )
 
         st.success(f"✨ Done! Total time: {datetime.now() - start}")
+
+# ── Admin: refresh internal DNC from Drive ────────────────────────────────────
+st.divider()
+with st.expander("🔧 Admin — Refresh Internal DNC Files"):
+    if not ADMIN_PASSWORD:
+        st.warning("ADMIN_PASSWORD env var is not set — refresh is disabled.")
+    else:
+        pwd = st.text_input("Admin password", type="password", key="admin_pwd")
+        if st.button("Refresh from Google Drive"):
+            if pwd != ADMIN_PASSWORD:
+                st.error("Incorrect password.")
+            else:
+                with st.spinner("Downloading files from Google Drive…"):
+                    ok, msg = refresh_internal_dnc_from_drive()
+                for line in msg.splitlines():
+                    st.write(line)
+                if ok:
+                    st.success("Internal DNC files updated successfully.")
+                else:
+                    st.error("One or more files failed to download — check logs above.")
