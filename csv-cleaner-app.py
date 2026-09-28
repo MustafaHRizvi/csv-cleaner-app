@@ -618,15 +618,19 @@ if st.button("Run Cleaning"):
 
         st.success(f"✨ Done! Total time: {datetime.now() - start}")
 
-# ── Admin: refresh internal DNC from Drive ────────────────────────────────────
+# ── Admin panel ───────────────────────────────────────────────────────────────
 st.divider()
-with st.expander("🔧 Admin — Refresh Internal DNC Files"):
+with st.expander("🔧 Admin"):
     if not ADMIN_PASSWORD:
-        st.warning("ADMIN_PASSWORD env var is not set — refresh is disabled.")
+        st.warning("ADMIN_PASSWORD env var is not set — admin panel is disabled.")
     else:
         pwd = st.text_input("Admin password", type="password", key="admin_pwd")
+        admin_ok = pwd == ADMIN_PASSWORD
+
+        # ── Refresh DNC files ────────────────────────────────────────────────
+        st.markdown("#### Refresh Internal DNC Files")
         if st.button("Refresh from Google Drive"):
-            if pwd != ADMIN_PASSWORD:
+            if not admin_ok:
                 st.error("Incorrect password.")
             else:
                 with st.spinner("Downloading files from Google Drive…"):
@@ -637,3 +641,94 @@ with st.expander("🔧 Admin — Refresh Internal DNC Files"):
                     st.success("Internal DNC files updated successfully.")
                 else:
                     st.error("One or more files failed to download — see table above.")
+
+        st.divider()
+
+        # ── Internal DNC lookup ──────────────────────────────────────────────
+        st.markdown("#### Look Up a Contact in Internal DNC Lists")
+        lookup_val = st.text_input(
+            "Email, phone number, or domain",
+            placeholder="e.g. john@example.com  or  7326917161  or  example.com",
+            key="lookup_val",
+        )
+        if st.button("Check Internal DNC", key="btn_lookup"):
+            if not admin_ok:
+                st.error("Incorrect password.")
+            elif not lookup_val.strip():
+                st.warning("Enter a value to look up.")
+            else:
+                dnc = load_internal_dnc()
+                v = lookup_val.strip()
+                found = []
+
+                # Email exact match
+                cleaned_email = clean_email(v)
+                if cleaned_email and cleaned_email in dnc["emails"]:
+                    found.append("✅ **Email** — matched in Emails.csv")
+
+                # Domain match (either bare domain or extracted from email)
+                cleaned_domain = clean_domain(v)
+                if cleaned_domain and cleaned_domain in dnc["domains"]:
+                    found.append(f"✅ **Domain** (`{cleaned_domain}`) — matched in Domains.csv")
+
+                # Phone match
+                cleaned_phone = clean_phone(v)
+                if cleaned_phone and cleaned_phone in dnc["phones"]:
+                    found.append(f"✅ **Phone** (`{cleaned_phone}`) — matched in Phones.csv")
+
+                if found:
+                    for line in found:
+                        st.markdown(line)
+                else:
+                    st.info("Not found in any internal DNC list.")
+
+        st.divider()
+
+        # ── Single TCPA lookup ───────────────────────────────────────────────
+        st.markdown("#### Check a Phone Number Against TCPA API")
+        tcpa_lookup_num = st.text_input(
+            "Phone number (any format)",
+            placeholder="e.g. +1 (732) 691-7161  or  7326917161",
+            key="tcpa_lookup_num",
+        )
+        if st.button("Check TCPA", key="btn_tcpa_lookup"):
+            if not admin_ok:
+                st.error("Incorrect password.")
+            elif not (TCPA_USER and TCPA_PASS):
+                st.error("TCPA credentials are not configured on the server.")
+            elif not tcpa_lookup_num.strip():
+                st.warning("Enter a phone number.")
+            else:
+                normalised = clean_phone(tcpa_lookup_num.strip())
+                if not normalised:
+                    st.error("Could not parse a valid phone number from that input.")
+                else:
+                    st.write(f"Checking `{normalised}` (normalised from `{tcpa_lookup_num.strip()}`)…")
+                    try:
+                        results = scrub_tcpa_batch([normalised], TCPA_USER, TCPA_PASS)
+                        result  = results.get(normalised, {})
+                        if str(result.get("clean", "1")) == "0":
+                            status_array = result.get("status_array") or []
+                            mapping = {
+                                "federal_dnc": "federal_dnc",
+                                "state_dnc":   "state_dnc",
+                                "tcpa":        "tcpa_litigator",
+                                "complainers": "complainer",
+                                "complainer":  "complainer",
+                            }
+                            if status_array:
+                                vals = [mapping[v] for v in status_array if v in mapping]
+                            else:
+                                vals = []
+                                if result.get("on_federal_dnc") == "Y": vals.append("federal_dnc")
+                                if result.get("on_state_dnc")   == "Y": vals.append("state_dnc")
+                                if result.get("on_tcpa")        == "Y": vals.append("tcpa_litigator")
+                                if result.get("on_complainers") == "Y": vals.append("complainer")
+                            label = ";".join(vals) if vals else "flagged"
+                            st.error(f"🚫 **Flagged** — `{label}`")
+                        elif result:
+                            st.success("✅ **Clean** — not found on any TCPA list.")
+                        else:
+                            st.warning("No result returned for this number.")
+                    except Exception as exc:
+                        st.error(f"API error: {exc}")
