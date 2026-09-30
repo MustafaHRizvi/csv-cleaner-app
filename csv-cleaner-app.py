@@ -191,23 +191,43 @@ def load_suppression_data(files):
     logs = []
 
     for f in files:
+        fname = getattr(f, "name", str(f))
         try:
-            df = pd.read_csv(f, dtype=str, nrows=200000)
+            # Read in chunks — suppression files can be very large (700K+ rows)
             found = []
-            for c in df.columns:
-                lc = c.lower()
-                if "email" in lc:
-                    emails.update(df[c].dropna().map(normalize_suppression_email))
-                    found.append(c)
-                elif "phone" in lc:
-                    phones.update(df[c].dropna().map(clean_phone))
-                    found.append(c)
-                elif any(x in lc for x in ["domain", "website", "url"]):
-                    domains.update(df[c].dropna().map(clean_domain))
-                    found.append(c)
-            logs.append(f"✅ {getattr(f,'name',f)}: found {', '.join(found) if found else 'no usable columns'}")
+            col_types = {}   # col -> "email" | "phone" | "domain"
+
+            for chunk in pd.read_csv(
+                f, dtype=str, chunksize=50_000,
+                engine="python", on_bad_lines="skip",
+            ):
+                if not col_types:
+                    for c in chunk.columns:
+                        lc = c.lower()
+                        if "email" in lc:
+                            col_types[c] = "email"
+                            found.append(c)
+                        elif "phone" in lc:
+                            col_types[c] = "phone"
+                            found.append(c)
+                        elif any(x in lc for x in ["domain", "website", "url"]):
+                            col_types[c] = "domain"
+                            found.append(c)
+
+                for c, kind in col_types.items():
+                    if kind == "email":
+                        emails.update(chunk[c].dropna().map(normalize_suppression_email))
+                    elif kind == "phone":
+                        phones.update(chunk[c].dropna().map(clean_phone))
+                    elif kind == "domain":
+                        domains.update(chunk[c].dropna().map(clean_domain))
+
+            logs.append(
+                f"✅ {fname}: loaded {', '.join(found) if found else 'no usable columns'} "
+                f"({len(emails):,} emails / {len(phones):,} phones / {len(domains):,} domains so far)"
+            )
         except Exception as e:
-            logs.append(f"⚠️ {getattr(f,'name',f)} skipped: {e}")
+            logs.append(f"⚠️ {fname} skipped: {e}")
 
     emails.discard(None)
     phones.discard(None)
