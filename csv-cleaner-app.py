@@ -1,4 +1,4 @@
-import os, re, io, gc, json, tempfile
+import os, re, io, gc, json, tempfile, csv
 import requests
 import pandas as pd
 import tldextract
@@ -192,46 +192,70 @@ def load_suppression_data(files):
 
     for f in files:
         fname = getattr(f, "name", str(f))
+        tmp_path = None
         try:
-            # Read in chunks — suppression files can be very large (700K+ rows)
-            found = []
-            col_types = {}   # col -> "email" | "phone" | "domain"
+            # Write to disk first so Streamlit's in-memory buffer can be freed
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+            tmp.write(f.getbuffer())
+            tmp_path = tmp.name
+            tmp.close()
 
-            for chunk in pd.read_csv(
-                f, dtype=str, chunksize=50_000,
-                engine="python", on_bad_lines="skip",
-            ):
+            col_types = {}   # col_index -> "email" | "phone" | "domain"
+            col_names = []
+            row_count = 0
+
+            with open(tmp_path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+                reader = csv.reader(fh)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    logs.append(f"⚠️ {fname}: empty file")
+                    continue
+
+                for i, col in enumerate(header):
+                    lc = col.strip().lower()
+                    if "email" in lc:
+                        col_types[i] = "email"
+                        col_names.append(col.strip())
+                    elif "phone" in lc:
+                        col_types[i] = "phone"
+                        col_names.append(col.strip())
+                    elif any(x in lc for x in ["domain", "website", "url"]):
+                        col_types[i] = "domain"
+                        col_names.append(col.strip())
+
                 if not col_types:
-                    for c in chunk.columns:
-                        lc = c.lower()
-                        if "email" in lc:
-                            col_types[c] = "email"
-                            found.append(c)
-                        elif "phone" in lc:
-                            col_types[c] = "phone"
-                            found.append(c)
-                        elif any(x in lc for x in ["domain", "website", "url"]):
-                            col_types[c] = "domain"
-                            found.append(c)
+                    logs.append(f"⚠️ {fname}: no usable columns found (columns: {header})")
+                    continue
 
-                for c, kind in col_types.items():
-                    if kind == "email":
-                        emails.update(chunk[c].dropna().map(normalize_suppression_email))
-                    elif kind == "phone":
-                        phones.update(chunk[c].dropna().map(clean_phone))
-                    elif kind == "domain":
-                        domains.update(chunk[c].dropna().map(clean_domain))
+                for row in reader:
+                    row_count += 1
+                    for i, kind in col_types.items():
+                        if i >= len(row):
+                            continue
+                        val = row[i].strip()
+                        if not val:
+                            continue
+                        if kind == "email":
+                            v = normalize_suppression_email(val)
+                            if v: emails.add(v)
+                        elif kind == "phone":
+                            v = clean_phone(val)
+                            if v: phones.add(v)
+                        elif kind == "domain":
+                            v = clean_domain(val)
+                            if v: domains.add(v)
 
             logs.append(
-                f"✅ {fname}: loaded {', '.join(found) if found else 'no usable columns'} "
-                f"({len(emails):,} emails / {len(phones):,} phones / {len(domains):,} domains so far)"
+                f"✅ {fname}: {row_count:,} rows, columns used: {', '.join(col_names)}"
             )
         except Exception as e:
             logs.append(f"⚠️ {fname} skipped: {e}")
+        finally:
+            if tmp_path:
+                try: os.remove(tmp_path)
+                except: pass
 
-    emails.discard(None)
-    phones.discard(None)
-    domains.discard(None)
     return {"emails": emails, "phones": phones, "domains": domains, "logs": logs}
 
 
