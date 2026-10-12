@@ -200,12 +200,20 @@ def refresh_tcpa_cache_from_drive():
     os.makedirs(os.path.dirname(TCPA_CACHE_DB), exist_ok=True)
     size_before = os.path.getsize(TCPA_CACHE_DB) if os.path.exists(TCPA_CACHE_DB) else None
     try:
+        session = requests.Session()
         url = f"https://drive.google.com/uc?export=download&id={TCPA_CACHE_DRIVE_ID}"
-        resp = requests.get(url, timeout=300, allow_redirects=True)
+        resp = session.get(url, timeout=300, allow_redirects=True)
         resp.raise_for_status()
-        if b"virus scan warning" in resp.content[:2000].lower():
-            url = f"https://drive.google.com/uc?export=download&id={TCPA_CACHE_DRIVE_ID}&confirm=t"
-            resp = requests.get(url, timeout=300, allow_redirects=True)
+        # Large files get an interstitial — detect by content-type or HTML body
+        content_type = resp.headers.get("Content-Type", "")
+        is_html = "text/html" in content_type or resp.content[:5] in (b"<!DOC", b"<html")
+        if is_html:
+            # Extract confirm token from response and retry
+            import re as _re
+            token_match = _re.search(rb'confirm=([0-9A-Za-z_\-]+)', resp.content)
+            confirm = token_match.group(1).decode() if token_match else "t"
+            url = f"https://drive.google.com/uc?export=download&id={TCPA_CACHE_DRIVE_ID}&confirm={confirm}"
+            resp = session.get(url, timeout=300, allow_redirects=True)
             resp.raise_for_status()
         with open(TCPA_CACHE_DB, "wb") as f:
             f.write(resp.content)
