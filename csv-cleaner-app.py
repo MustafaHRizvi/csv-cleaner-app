@@ -201,7 +201,7 @@ def refresh_tcpa_cache_from_drive():
     size_before = os.path.getsize(TCPA_CACHE_DB) if os.path.exists(TCPA_CACHE_DB) else None
     try:
         import gdown
-        gdown.download(id=TCPA_CACHE_DRIVE_ID, output=TCPA_CACHE_DB, quiet=True, fuzzy=False)
+        gdown.download(id=TCPA_CACHE_DRIVE_ID, output=TCPA_CACHE_DB, quiet=True)
         size_after = os.path.getsize(TCPA_CACHE_DB)
         if size_after < 1024:
             return False, f"Download produced only {size_after} bytes — file may not be publicly shared."
