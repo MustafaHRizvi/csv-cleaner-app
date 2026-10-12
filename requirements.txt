@@ -3,3 +3,4 @@ pandas
 tldextract
 requests
 python-dotenv
+gdown
