@@ -1,10 +1,10 @@
-import os, re, io, gc, json, tempfile, csv
+import os, re, io, gc, json, tempfile, csv, sqlite3
 import requests
 import pandas as pd
 import tldextract
 import streamlit as st
 from zipfile import ZipFile
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,6 +17,11 @@ TCPA_USER       = os.environ.get("TCPA_USER", "")
 TCPA_PASS       = os.environ.get("TCPA_PASS", "")
 ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD", "")
 
+# TCPA cache SQLite DB on persistent disk (set TCPA_CACHE_DB env var on Render)
+_SCRIPT_DIR_APP  = os.path.dirname(os.path.abspath(__file__))
+TCPA_CACHE_DB    = os.environ.get("TCPA_CACHE_DB", os.path.join(_SCRIPT_DIR_APP, "tcpa_cache.db"))
+TCPA_CACHE_TTL   = 60  # days — results older than this trigger a fresh API call
+
 _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 INTERNAL_DNC_DIR = os.environ.get("INTERNAL_DNC_DIR", os.path.join(_SCRIPT_DIR, "internal_dnc"))
 
@@ -26,6 +31,9 @@ DRIVE_FILE_IDS = {
     "Phones.csv":  os.environ.get("PHONES_DRIVE_ID", ""),
     "Domains.csv": os.environ.get("DOMAINS_DRIVE_ID", ""),
 }
+
+# Google Drive file ID for the TCPA cache DB
+TCPA_CACHE_DRIVE_ID = os.environ.get("TCPA_CACHE_DRIVE_ID", "")
 
 # tcpa_dnc_status labels — match HubSpot property values
 LABEL_INTERNAL_DNC = "internal_dnc"   # used for both internal DNC and uploaded suppression files
@@ -181,6 +189,33 @@ def refresh_internal_dnc_from_drive():
 
     ok = error_msg is None
     return ok, results, error_msg
+
+
+# ============================================================
+# REFRESH TCPA CACHE DB FROM GOOGLE DRIVE
+# ============================================================
+def refresh_tcpa_cache_from_drive():
+    if not TCPA_CACHE_DRIVE_ID:
+        return False, "TCPA_CACHE_DRIVE_ID env var is not configured."
+    os.makedirs(os.path.dirname(TCPA_CACHE_DB), exist_ok=True)
+    size_before = os.path.getsize(TCPA_CACHE_DB) if os.path.exists(TCPA_CACHE_DB) else None
+    try:
+        url = f"https://drive.google.com/uc?export=download&id={TCPA_CACHE_DRIVE_ID}"
+        resp = requests.get(url, timeout=300, allow_redirects=True)
+        resp.raise_for_status()
+        if b"virus scan warning" in resp.content[:2000].lower():
+            url = f"https://drive.google.com/uc?export=download&id={TCPA_CACHE_DRIVE_ID}&confirm=t"
+            resp = requests.get(url, timeout=300, allow_redirects=True)
+            resp.raise_for_status()
+        with open(TCPA_CACHE_DB, "wb") as f:
+            f.write(resp.content)
+        size_after = os.path.getsize(TCPA_CACHE_DB)
+        return True, (
+            f"Downloaded {size_after / 1024 / 1024:.1f} MB → `{TCPA_CACHE_DB}`"
+            + (f" (was {size_before / 1024 / 1024:.1f} MB)" if size_before else "")
+        )
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ============================================================
@@ -435,6 +470,98 @@ def scrub_tcpa_batch(phones_batch, user, password):
     except Exception:
         return _tcpa_post(phones_batch, user, password, TCPA_BACKUP_URL)
 
+# ============================================================
+# TCPA CACHE (SQLite on persistent disk)
+# ============================================================
+def _cache_conn():
+    """Open a connection to the SQLite cache, creating the table if needed."""
+    con = sqlite3.connect(TCPA_CACHE_DB, check_same_thread=False)
+    con.execute("""CREATE TABLE IF NOT EXISTS tcpa_cache (
+        phone TEXT PRIMARY KEY,
+        tcpa_dnc_status TEXT NOT NULL,
+        checked_date TEXT NOT NULL
+    )""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_checked_date ON tcpa_cache(checked_date)")
+    return con
+
+def cache_lookup(phones: list[str]) -> tuple[dict[str, str], list[str]]:
+    """
+    Returns (hits, misses).
+    hits  = {phone: tcpa_dnc_status} for phones in cache with date <= TTL
+    misses = phones not in cache or whose cached date is too old
+    """
+    if not os.path.exists(TCPA_CACHE_DB) or not phones:
+        return {}, list(phones)
+
+    cutoff = (date.today() - timedelta(days=TCPA_CACHE_TTL)).isoformat()
+    hits, misses = {}, []
+    try:
+        con = _cache_conn()
+        # Query in batches to stay within SQLite parameter limit
+        BATCH = 900
+        results = {}
+        for i in range(0, len(phones), BATCH):
+            chunk = phones[i:i+BATCH]
+            placeholders = ",".join("?" * len(chunk))
+            rows = con.execute(
+                f"SELECT phone, tcpa_dnc_status, checked_date FROM tcpa_cache "
+                f"WHERE phone IN ({placeholders})",
+                chunk
+            ).fetchall()
+            for phone, status, checked_date in rows:
+                results[phone] = (status, checked_date)
+        con.close()
+
+        for p in phones:
+            if p in results:
+                status, checked_date = results[p]
+                if checked_date >= cutoff:
+                    hits[p] = status
+                else:
+                    misses.append(p)
+            else:
+                misses.append(p)
+    except Exception:
+        misses = list(phones)
+    return hits, misses
+
+def cache_write(entries: dict[str, str]):
+    """Write {phone: tcpa_dnc_status} to cache with today's date."""
+    if not entries:
+        return
+    today = date.today().isoformat()
+    rows = [(p, s, today) for p, s in entries.items()]
+    try:
+        con = _cache_conn()
+        con.executemany(
+            "INSERT OR REPLACE INTO tcpa_cache VALUES (?,?,?)", rows
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+def cache_stats() -> dict:
+    """Return row count and date range from the cache DB."""
+    if not os.path.exists(TCPA_CACHE_DB):
+        return {"exists": False}
+    try:
+        con = _cache_conn()
+        total, = con.execute("SELECT COUNT(*) FROM tcpa_cache").fetchone()
+        min_date, max_date = con.execute(
+            "SELECT MIN(checked_date), MAX(checked_date) FROM tcpa_cache"
+        ).fetchone()
+        cutoff = (date.today() - timedelta(days=TCPA_CACHE_TTL)).isoformat()
+        fresh, = con.execute(
+            "SELECT COUNT(*) FROM tcpa_cache WHERE checked_date >= ?", (cutoff,)
+        ).fetchone()
+        con.close()
+        return {"exists": True, "total": total, "fresh": fresh,
+                "min_date": min_date, "max_date": max_date}
+    except Exception as e:
+        return {"exists": True, "error": str(e)}
+
+
 def collect_phones_from_files(clean_paths):
     all_phones: set[str] = set()
     for path in clean_paths.values():
@@ -456,15 +583,24 @@ def tcpa_scrub_cleaned_files(clean_paths, tcpa_internal_paths, dnc_paths, summar
     phone_list = list(all_phones)
     st.write(f"  {len(phone_list):,} unique phone numbers to scrub")
 
-    # phone -> tcpa_dnc_status label derived from API response
-    phone_status: dict[str, str] = {}
-    total_batches = max(1, (len(phone_list) + TCPA_BATCH_SIZE - 1) // TCPA_BATCH_SIZE)
+    # ── Cache lookup ──────────────────────────────────────────────────────────
+    cache_hits, api_phones = cache_lookup(phone_list)
+    st.write(f"  {len(cache_hits):,} served from cache · {len(api_phones):,} need API call")
+
+    # phone -> tcpa_dnc_status — seed with cache hits (non-clear only)
+    phone_status: dict[str, str] = {
+        p: s for p, s in cache_hits.items() if s != "clear"
+    }
+
+    # ── API for cache misses ──────────────────────────────────────────────────
+    new_cache_entries: dict[str, str] = {}
+    total_batches = max(1, (len(api_phones) + TCPA_BATCH_SIZE - 1) // TCPA_BATCH_SIZE)
     tcpa_bar    = st.progress(0)
     tcpa_status = st.empty()
 
-    for i, start in enumerate(range(0, len(phone_list), TCPA_BATCH_SIZE), 1):
-        batch = phone_list[start : start + TCPA_BATCH_SIZE]
-        tcpa_status.write(f"TCPA scrub: batch {i}/{total_batches} ({len(batch)} numbers)…")
+    for i, start in enumerate(range(0, len(api_phones), TCPA_BATCH_SIZE), 1):
+        batch = api_phones[start : start + TCPA_BATCH_SIZE]
+        tcpa_status.write(f"TCPA API: batch {i}/{total_batches} ({len(batch)} numbers)…")
         try:
             results = scrub_tcpa_batch(batch, user, password)
             for phone, result in results.items():
@@ -485,12 +621,22 @@ def tcpa_scrub_cleaned_files(clean_paths, tcpa_internal_paths, dnc_paths, summar
                         if result.get("on_state_dnc")   == "Y": vals.append("state_dnc")
                         if result.get("on_tcpa")         == "Y": vals.append("tcpa_litigator")
                         if result.get("on_complainers")  == "Y": vals.append("complainer")
-                    phone_status[phone] = ";".join(vals) if vals else "federal_dnc"
+                    status = ";".join(vals) if vals else "federal_dnc"
+                    phone_status[phone] = status
+                    new_cache_entries[phone] = status
+                else:
+                    new_cache_entries[phone] = "clear"
         except Exception as exc:
             st.warning(f"Batch {i} failed: {exc}")
         tcpa_bar.progress(int(i / total_batches * 100))
 
     tcpa_bar.progress(100)
+
+    # Write new API results to cache
+    if new_cache_entries:
+        cache_write(new_cache_entries)
+        st.write(f"  {len(new_cache_entries):,} results written to cache")
+
     flagged_phones = set(phone_status.keys())
     st.write(f"  {len(flagged_phones):,} phone numbers flagged by TCPA")
 
@@ -725,6 +871,33 @@ with st.expander("🔧 Admin"):
                         st.markdown(line)
                 else:
                     st.info("Not found in any internal DNC list.")
+
+        st.divider()
+
+        # ── TCPA Cache ───────────────────────────────────────────────────────
+        st.markdown("#### TCPA Cache")
+        if st.button("Refresh TCPA Cache from Google Drive", key="btn_refresh_cache"):
+            if not admin_ok:
+                st.error("Incorrect password.")
+            else:
+                with st.spinner("Downloading tcpa_cache.db from Google Drive…"):
+                    ok, msg = refresh_tcpa_cache_from_drive()
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(f"Download failed: {msg}")
+        st.markdown("**Cache stats:**")
+        stats = cache_stats()
+        if not stats.get("exists"):
+            st.info(f"Cache DB not found at: `{TCPA_CACHE_DB}`")
+        elif "error" in stats:
+            st.warning(f"Cache DB error: {stats['error']}")
+        else:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total phones", f"{stats['total']:,}")
+            col2.metric(f"Fresh (≤{TCPA_CACHE_TTL}d)", f"{stats['fresh']:,}")
+            col3.metric("Stale", f"{stats['total'] - stats['fresh']:,}")
+            st.caption(f"Date range: {stats['min_date']} → {stats['max_date']}  |  DB: `{TCPA_CACHE_DB}`")
 
         st.divider()
 
